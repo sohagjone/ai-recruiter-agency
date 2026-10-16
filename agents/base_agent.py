@@ -14,7 +14,6 @@ PROVIDERS = [
         "secret": "GEMINI_API_KEY",
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
         "preferred": [
-            "gemini-3.8-flash",
             "gemini-2.5-flash",
             "gemini-2.5-flash-lite",
             "gemini-3-flash-preview",
