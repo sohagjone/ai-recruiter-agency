@@ -3,35 +3,41 @@ import os
 import time
 from typing import Any, Dict, List, Optional
 
-from openai import OpenAI, RateLimitError
+from openai import NotFoundError, OpenAI, RateLimitError
 
 # Free providers that speak the OpenAI API. The app tries them in this order and
-# uses every one that has a key in Streamlit Secrets. If one hits its limit,
-# it automatically moves on to the next.
+# uses every one that has a key in Streamlit Secrets. If one fails or hits its
+# limit, it automatically moves on to the next.
 PROVIDERS = [
     {
         "name": "gemini",
-        "secret": "GEMINI_API_KEY",
+        # either secret name works
+        "secrets": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
         "preferred": [
-            "gemini-2.5-flash",
             "gemini-2.5-flash-lite",
+            "gemini-2.5-flash",
             "gemini-3-flash-preview",
             "gemini-flash-latest",
         ],
         "prefer_word": "flash",
+        "avoid": (),
+        "max_tokens": 6000,          # Gemini 2.5 can spend some on thinking
+        "max_prompt_chars": 60000,   # about 15,000 tokens
     },
     {
         "name": "groq",
-        "secret": "GROQ_API_KEY",
+        "secrets": ("GROQ_API_KEY",),
         "base_url": "https://api.groq.com/openai/v1",
         "preferred": [
-            "llama-3.3-70b-versatile",
-            "llama-3.1-8b-instant",
             "meta-llama/llama-4-scout-17b-16e-instruct",
-            "openai/gpt-oss-120b",
+            "llama-3.3-70b-versatile",
         ],
         "prefer_word": None,
+        # gpt-oss models are limited to 8,000 tokens per minute on the free plan
+        "avoid": ("gpt-oss",),
+        "max_tokens": 1500,          # Groq counts the requested output size too
+        "max_prompt_chars": 20000,   # about 5,000 tokens
     },
 ]
 
@@ -53,13 +59,28 @@ def _get_secret(name: str) -> Optional[str]:
     return value or os.getenv(name)
 
 
+def _get_first_secret(names) -> Optional[str]:
+    for name in names:
+        value = _get_secret(name)
+        if value:
+            return value
+    return None
+
+
+def _trim_prompt(prompt: str, max_chars: int) -> str:
+    """Cut very long prompts so they stay under the provider's token limits."""
+    if len(prompt) <= max_chars:
+        return prompt
+    return prompt[:max_chars]
+
+
 def _pick_model(provider: dict, client: OpenAI) -> str:
     """Choose a model that really exists for this key (model lists change often)."""
     name = provider["name"]
     if name in _model_cache:
         return _model_cache[name]
 
-    override = _get_secret(f"{name.upper()}_MODEL")  # e.g. GEMINI_MODEL in Secrets
+    override = _get_secret(f"{name.upper()}_MODEL")  # e.g. GROQ_MODEL in Secrets
     if override:
         _model_cache[name] = override
         return override
@@ -71,6 +92,8 @@ def _pick_model(provider: dict, client: OpenAI) -> str:
             return candidate
 
     chat = [m for m in available if not any(w in m.lower() for w in SKIP_WORDS)]
+    avoid = provider.get("avoid", ())
+    chat = [m for m in chat if not any(a in m.lower() for a in avoid)] or chat
     word = provider["prefer_word"]
     if word:
         flash = [m for m in chat if word in m.lower()]
@@ -88,7 +111,7 @@ class BaseAgent:
 
         self.clients: List[tuple] = []  # (provider, client)
         for p in PROVIDERS:
-            key = _get_secret(p["secret"])
+            key = _get_first_secret(p["secrets"])
             if key:
                 self.clients.append((p, OpenAI(base_url=p["base_url"], api_key=key)))
         if not self.clients:
@@ -106,11 +129,14 @@ class BaseAgent:
         It now calls free cloud models instead of a local Ollama server."""
         errors = []
         for provider, client in self.clients:
+            pname = provider["name"]
             try:
                 model = _pick_model(provider, client)
             except Exception as e:
-                errors.append(f"{provider['name']}: {e}")
+                errors.append(f"{pname}: {str(e)[:400]}")
                 continue
+
+            safe_prompt = _trim_prompt(prompt, provider["max_prompt_chars"])
 
             for attempt in range(2):
                 try:
@@ -118,18 +144,26 @@ class BaseAgent:
                         model=model,
                         messages=[
                             {"role": "system", "content": self.instructions},
-                            {"role": "user", "content": prompt},
+                            {"role": "user", "content": safe_prompt},
                         ],
-                        temperature=0.7,
-                        max_tokens=4000,
+                        temperature=0.3,
+                        max_tokens=provider["max_tokens"],
                     )
-                    return response.choices[0].message.content or ""
+                    text = response.choices[0].message.content or ""
+                    if text.strip():
+                        return text
+                    errors.append(f"{pname} ({model}): empty response")
+                    break  # try the next provider
                 except RateLimitError as e:
-                    errors.append(f"{provider['name']} ({model}) rate limit: {e}")
+                    errors.append(f"{pname} ({model}) rate limit: {str(e)[:400]}")
                     if attempt == 0:
-                        time.sleep(8)  # short wait, then retry once
+                        time.sleep(15)  # short wait, then retry once
+                except NotFoundError as e:
+                    _model_cache.pop(pname, None)  # model was retired; re-pick next time
+                    errors.append(f"{pname} ({model}) not found: {str(e)[:400]}")
+                    break
                 except Exception as e:
-                    errors.append(f"{provider['name']} ({model}): {e}")
+                    errors.append(f"{pname} ({model}): {str(e)[:400]}")
                     break  # not a rate limit, go to the next provider
 
         raise RuntimeError("All providers failed. " + " | ".join(errors))
