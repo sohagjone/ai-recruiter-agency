@@ -1,3 +1,4 @@
+import ast
 import json
 import os
 import time
@@ -6,13 +7,12 @@ from typing import Any, Dict, List, Optional
 from openai import NotFoundError, OpenAI, RateLimitError
 
 # Free providers that speak the OpenAI API. The app tries them in this order and
-# uses every one that has a key in Streamlit Secrets. If one fails or hits its
-# limit, it automatically moves on to the next.
+# uses every one that has a key in Streamlit Secrets (or in a local .env file).
+# If one fails or hits its limit, it automatically moves on to the next.
 PROVIDERS = [
     {
         "name": "gemini",
-        # either secret name works
-        "secrets": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
+        "secrets": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),  # either name works
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
         "preferred": [
             "gemini-2.5-flash-lite",
@@ -22,33 +22,38 @@ PROVIDERS = [
         ],
         "prefer_word": "flash",
         "avoid": (),
-        "max_tokens": 6000,          # Gemini 2.5 can spend some on thinking
-        "max_prompt_chars": 60000,   # about 15,000 tokens
+        "allow_any_fallback": True,
+        "max_tokens": 4000,
+        "max_prompt_chars": 60000,  # about 15,000 tokens
     },
     {
         "name": "groq",
         "secrets": ("GROQ_API_KEY",),
         "base_url": "https://api.groq.com/openai/v1",
+        # Groq's free plan now lists only these text models (8K tokens per minute each).
         "preferred": [
-            "meta-llama/llama-4-scout-17b-16e-instruct",
-            "llama-3.3-70b-versatile",
+            "openai/gpt-oss-120b",
+            "qwen/qwen3.8-27b",
+            "openai/gpt-oss-20b",
         ],
         "prefer_word": None,
-        # gpt-oss models are limited to 8,000 tokens per minute on the free plan
-        "avoid": ("gpt-oss",),
-        "max_tokens": 1500,          # Groq counts the requested output size too
-        "max_prompt_chars": 20000,   # about 5,000 tokens
+        "avoid": ("allam", "safeguard", "guard", "orpheus", "whisper"),
+        # Never pick "any other model": small ones such as allam-2-7b run out of context.
+        "allow_any_fallback": False,
+        "max_tokens": 2000,         # Groq counts the requested output size too
+        "max_prompt_chars": 12000,  # about 3,000 tokens, so input + output stays under 8K
     },
 ]
 
 # Models that can't do normal text chat
-SKIP_WORDS = ("whisper", "tts", "guard", "orpheus", "playai", "embed", "image",
-              "imagen", "veo", "aqa", "live", "audio", "vision-only")
+SKIP_WORDS = ("whisper", "tts", "guard", "safeguard", "orpheus", "playai", "embed",
+              "image", "imagen", "veo", "aqa", "live", "audio", "vision-only", "allam")
 
 _model_cache: Dict[str, str] = {}  # provider name -> model id (found once)
 
 
 def _get_secret(name: str) -> Optional[str]:
+    """Read a value from Streamlit Secrets, falling back to environment variables."""
     value = None
     try:
         import streamlit as st
@@ -69,9 +74,7 @@ def _get_first_secret(names) -> Optional[str]:
 
 def _trim_prompt(prompt: str, max_chars: int) -> str:
     """Cut very long prompts so they stay under the provider's token limits."""
-    if len(prompt) <= max_chars:
-        return prompt
-    return prompt[:max_chars]
+    return prompt if len(prompt) <= max_chars else prompt[:max_chars]
 
 
 def _pick_model(provider: dict, client: OpenAI) -> str:
@@ -91,13 +94,20 @@ def _pick_model(provider: dict, client: OpenAI) -> str:
             _model_cache[name] = candidate
             return candidate
 
+    if not provider.get("allow_any_fallback", True):
+        raise RuntimeError(
+            f"{name}: none of the expected models {provider['preferred']} is enabled "
+            f"for this key. Models your key can see: {available}. "
+            f"Set {name.upper()}_MODEL in Secrets to a model you want to use."
+        )
+
     chat = [m for m in available if not any(w in m.lower() for w in SKIP_WORDS)]
     avoid = provider.get("avoid", ())
     chat = [m for m in chat if not any(a in m.lower() for a in avoid)] or chat
     word = provider["prefer_word"]
     if word:
-        flash = [m for m in chat if word in m.lower()]
-        chat = flash or chat
+        preferred = [m for m in chat if word in m.lower()]
+        chat = preferred or chat
     if not chat:
         raise RuntimeError(f"{name}: no usable chat model found. Got: {available}")
     _model_cache[name] = chat[0]
@@ -105,9 +115,11 @@ def _pick_model(provider: dict, client: OpenAI) -> str:
 
 
 class BaseAgent:
-    def __init__(self, name: str, instructions: str):
+    def __init__(self, name: str, instructions: str, agent_type: str = "tools"):
+        # agent_type is accepted for backward compatibility with the old code.
         self.name = name
         self.instructions = instructions
+        self.agent_type = agent_type
 
         self.clients: List[tuple] = []  # (provider, client)
         for p in PROVIDERS:
@@ -116,17 +128,26 @@ class BaseAgent:
                 self.clients.append((p, OpenAI(base_url=p["base_url"], api_key=key)))
         if not self.clients:
             raise RuntimeError(
-                "No API key found. In Streamlit Cloud go to Manage app -> Settings -> "
-                "Secrets and add GEMINI_API_KEY and/or GROQ_API_KEY."
+                "No AI key found. In Streamlit Cloud go to Manage app -> Settings -> "
+                "Secrets and add GEMINI_API_KEY and/or GROQ_API_KEY. "
+                "Locally, put them in a .env file."
             )
 
     async def run(self, messages: list) -> Dict[str, Any]:
         """Default run method to be overridden by child classes"""
         raise NotImplementedError("Subclasses must implement run()")
 
-    def _query_ollama(self, prompt: str) -> str:
-        """Kept under the old name so the other agent files don't need changes.
-        It now calls free cloud models instead of a local Ollama server."""
+    @staticmethod
+    def _load_payload(content: str) -> Dict[str, Any]:
+        """Turn the message content back into a dict (JSON first, then a Python
+        literal). Never uses eval(), so user input cannot run code."""
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            return ast.literal_eval(content)
+
+    def _query_llm(self, prompt: str) -> str:
+        """Ask the free cloud models, trying each provider in turn."""
         errors = []
         for provider, client in self.clients:
             pname = provider["name"]
@@ -167,6 +188,10 @@ class BaseAgent:
                     break  # not a rate limit, go to the next provider
 
         raise RuntimeError("All providers failed. " + " | ".join(errors))
+
+    # Old name kept so older code that calls _query_ollama still works.
+    def _query_ollama(self, prompt: str) -> str:
+        return self._query_llm(prompt)
 
     def _parse_json_safely(self, text: str) -> Dict[str, Any]:
         """Safely parse JSON from text, handling potential errors"""
