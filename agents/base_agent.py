@@ -126,12 +126,13 @@ class BaseAgent:
             key = _get_first_secret(p["secrets"])
             if key:
                 self.clients.append((p, OpenAI(base_url=p["base_url"], api_key=key)))
-        if not self.clients:
-            raise RuntimeError(
-                "No AI key found. In Streamlit Cloud go to Manage app -> Settings -> "
-                "Secrets and add GEMINI_API_KEY and/or GROQ_API_KEY. "
-                "Locally, put them in a .env file."
-            )
+        # Without a key the app still works: the agents catch the error raised in
+        # _query_llm and fall back to the rule-based results (no written AI commentary).
+        self.no_key_message = (
+            "No AI key found. In Streamlit Cloud go to Manage app -> Settings -> "
+            "Secrets and add GEMINI_API_KEY and/or GROQ_API_KEY. "
+            "Locally, put them in a .env file."
+        )
 
     async def run(self, messages: list) -> Dict[str, Any]:
         """Default run method to be overridden by child classes"""
@@ -148,6 +149,8 @@ class BaseAgent:
 
     def _query_llm(self, prompt: str) -> str:
         """Ask the free cloud models, trying each provider in turn."""
+        if not self.clients:
+            raise RuntimeError(self.no_key_message)
         errors = []
         for provider, client in self.clients:
             pname = provider["name"]

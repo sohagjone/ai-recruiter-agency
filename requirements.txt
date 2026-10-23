@@ -1,8 +1,4 @@
-git+https://github.com/openai/swarm.git
 openai>=1.33.0
 pdfminer.six
 python-dotenv
-rich
 streamlit>=1.40.0
-streamlit-extras
-streamlit-option-menu
